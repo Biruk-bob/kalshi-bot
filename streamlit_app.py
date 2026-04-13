@@ -4,48 +4,85 @@ import pandas as pd
 import numpy as np
 import time
 
-# =========================
-# CONFIG
-# =========================
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+# Public market-data-only Binance base URL
+BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
 
-# =========================
-# FETCH DATA
-# =========================
+
 def get_binance_data(symbol="BTCUSDT", interval="1m", limit=100):
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data = requests.get(BINANCE_URL, params=params).json()
-    df = pd.DataFrame(data)
-    df = df.iloc[:, :6]
-    df.columns = ["time", "open", "high", "low", "close", "volume"]
-    df["close"] = df["close"].astype(float)
-    return df
 
-# =========================
-# INDICATORS
-# =========================
+    try:
+        response = requests.get(BINANCE_URL, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        # Binance kline response should be a list of lists
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError(f"Unexpected Binance response: {data}")
+
+        df = pd.DataFrame(
+            data,
+            columns=[
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_asset_volume",
+                "number_of_trades",
+                "taker_buy_base_asset_volume",
+                "taker_buy_quote_asset_volume",
+                "ignore",
+            ],
+        )
+
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna().reset_index(drop=True)
+        return df
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network/API error while fetching {symbol}: {e}")
+        return pd.DataFrame()
+
+    except ValueError as e:
+        st.error(f"Data error while fetching {symbol}: {e}")
+        return pd.DataFrame()
+
+
 def calculate_indicators(df):
-    df["ema_fast"] = df["close"].ewm(span=9).mean()
-    df["ema_slow"] = df["close"].ewm(span=21).mean()
+    if df.empty or len(df) < 30:
+        return df
+
+    df = df.copy()
+
+    df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
 
     delta = df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    df["macd"] = df["close"].ewm(span=12).mean() - df["close"].ewm(span=26).mean()
-    df["signal"] = df["macd"].ewm(span=9).mean()
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
     return df
 
-# =========================
-# DECISION LOGIC
-# =========================
+
 def get_signal(df):
+    if df.empty or len(df) < 30:
+        return "IGNORE"
+
     last = df.iloc[-1]
 
-    if np.isnan(last["rsi"]):
+    if pd.isna(last["rsi"]) or pd.isna(last["ema_fast"]) or pd.isna(last["ema_slow"]) or pd.isna(last["macd"]) or pd.isna(last["signal"]):
         return "IGNORE"
 
     bullish = (
@@ -62,14 +99,11 @@ def get_signal(df):
 
     if bullish:
         return "BUY YES"
-    elif bearish:
+    if bearish:
         return "BUY NO"
-    else:
-        return "IGNORE"
+    return "IGNORE"
 
-# =========================
-# UI
-# =========================
+
 st.set_page_config(page_title="Kalshi 15m Bot", layout="centered")
 
 st.title("Kalshi 15-Min Signal Bot")
@@ -78,12 +112,19 @@ st.write("BTC & ETH Signals (BUY YES / BUY NO / IGNORE)")
 refresh = st.slider("Refresh every (seconds)", 5, 60, 10)
 
 btc_df = get_binance_data("BTCUSDT")
-btc_df = calculate_indicators(btc_df)
-btc_signal = get_signal(btc_df)
-
 eth_df = get_binance_data("ETHUSDT")
-eth_df = calculate_indicators(eth_df)
-eth_signal = get_signal(eth_df)
+
+if not btc_df.empty:
+    btc_df = calculate_indicators(btc_df)
+    btc_signal = get_signal(btc_df)
+else:
+    btc_signal = "IGNORE"
+
+if not eth_df.empty:
+    eth_df = calculate_indicators(eth_df)
+    eth_signal = get_signal(eth_df)
+else:
+    eth_signal = "IGNORE"
 
 st.subheader("BTC Signal")
 st.write(f"### {btc_signal}")
