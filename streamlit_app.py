@@ -7,6 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# Official public market-data base according to Kalshi docs
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 BINANCE_BASE = "https://data-api.binance.vision"
 
@@ -79,7 +80,7 @@ def binance_klines(symbol="BTCUSDT", interval="1m", limit=180):
 # ----------------------------
 def get_open_markets(limit=1000):
     """
-    Pull open markets. Uses pagination cursor if present.
+    Pull open markets using Kalshi pagination.
     """
     all_markets = []
     cursor = None
@@ -104,9 +105,6 @@ def get_open_markets(limit=1000):
 
 
 def extract_target_price(text):
-    """
-    Tries to extract a price target from market title text.
-    """
     if not text:
         return None
 
@@ -130,9 +128,19 @@ def extract_target_price(text):
     return None
 
 
+def looks_like_15m_crypto_market(text):
+    text = text.lower()
+
+    has_crypto = any(x in text for x in ["btc", "bitcoin", "eth", "ether", "ethereum"])
+    has_15m = any(x in text for x in ["15 min", "15m", "15-minute", "15 minute"])
+    has_up_down_style = any(x in text for x in ["above", "below", "over", "under"])
+
+    return has_crypto and (has_15m or has_up_down_style)
+
+
 def asset_match_score(asset, market):
     """
-    Score markets for BTC or ETH using title/ticker text.
+    Score only from market fields returned by /markets.
     """
     text = " ".join([
         str(market.get("title", "")),
@@ -140,32 +148,36 @@ def asset_match_score(asset, market):
         str(market.get("yes_sub_title", "")),
         str(market.get("ticker", "")),
         str(market.get("event_ticker", "")),
+        str(market.get("series_ticker", "")),
     ]).lower()
+
+    if not looks_like_15m_crypto_market(text):
+        return 0
 
     score = 0
 
     if asset == "BTC":
         if "bitcoin" in text:
-            score += 5
-        if "btc" in text:
-            score += 5
-        if "kxbtc" in text:
             score += 8
+        if "btc" in text:
+            score += 8
+        if "kxbtc" in text:
+            score += 12
     elif asset == "ETH":
         if "ethereum" in text:
-            score += 5
-        if "ether" in text:
-            score += 3
-        if "eth" in text:
-            score += 5
-        if "kxeth" in text:
             score += 8
+        if "ether" in text:
+            score += 5
+        if "eth" in text:
+            score += 8
+        if "kxeth" in text:
+            score += 12
 
-    if "15 min" in text or "15m" in text or "15-minute" in text:
-        score += 5
+    if "15 min" in text or "15m" in text or "15-minute" in text or "15 minute" in text:
+        score += 10
 
-    if "crypto" in text:
-        score += 1
+    if any(x in text for x in ["above", "below", "over", "under"]):
+        score += 3
 
     return score
 
@@ -195,12 +207,16 @@ def choose_live_market_for_asset(asset):
         if not (open_dt <= now < close_dt):
             continue
 
-        seconds_left = int((close_dt - now).total_seconds())
-        if seconds_left <= 0 or seconds_left > 15 * 60 + 120:
-            continue
+        title = (
+            m.get("title")
+            or m.get("yes_sub_title")
+            or m.get("subtitle")
+            or m.get("ticker", "")
+        )
 
-        title = m.get("title") or m.get("yes_sub_title") or m.get("subtitle") or m.get("ticker", "")
         target = extract_target_price(title)
+        seconds_left = int((close_dt - now).total_seconds())
+        elapsed = int((now - open_dt).total_seconds())
 
         candidates.append({
             "score": score,
@@ -209,6 +225,8 @@ def choose_live_market_for_asset(asset):
             "target": target,
             "open_dt": open_dt,
             "close_dt": close_dt,
+            "elapsed": elapsed,
+            "seconds_left": seconds_left,
             "yes_bid": to_float(m.get("yes_bid_dollars")),
             "yes_ask": to_float(m.get("yes_ask_dollars")),
             "no_bid": to_float(m.get("no_bid_dollars")),
@@ -218,8 +236,17 @@ def choose_live_market_for_asset(asset):
     if not candidates:
         return None
 
-    # Best score first, then the one closing soonest
-    candidates.sort(key=lambda x: (-x["score"], x["close_dt"]))
+    # Prefer current 15m market:
+    # 1) best textual match
+    # 2) still early enough to evaluate
+    # 3) closest closing time
+    candidates.sort(
+        key=lambda x: (
+            -x["score"],
+            0 if x["elapsed"] <= 15 * 60 else 1,
+            x["close_dt"],
+        )
+    )
     return candidates[0]
 
 
@@ -360,9 +387,8 @@ def get_decision_key(asset, market):
 
 
 def decide_for_market(asset, market, df):
-    now = now_utc()
+    elapsed = market["elapsed"]
 
-    elapsed = int((now - market["open_dt"]).total_seconds())
     if elapsed < ENTRY_START_SEC:
         return {
             "signal": "WAIT",
@@ -422,7 +448,6 @@ def get_locked_decision(asset, market, df):
 
     key = get_decision_key(asset, market)
 
-    # Return existing lock for this exact market ticker
     if key in st.session_state.locked_decisions:
         return st.session_state.locked_decisions[key]
 
@@ -451,8 +476,7 @@ def render_asset(asset, binance_symbol):
     df = add_indicators(df)
     result = get_locked_decision(asset, market, df)
 
-    now = now_utc()
-    left = max(0, int((market["close_dt"] - now).total_seconds()))
+    left = max(0, market["seconds_left"])
     mins = left // 60
     secs = left % 60
 
