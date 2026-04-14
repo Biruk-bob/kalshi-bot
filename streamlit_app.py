@@ -1,4 +1,4 @@
-import ast
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -9,30 +9,23 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# ----------------------------
+# -------------------------------------------------
 # CONFIG
-# ----------------------------
+# -------------------------------------------------
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 BINANCE_BASE = "https://data-api.binance.vision"
 
 ENTRY_START_SEC = 120   # wait first 2 minutes
-ENTRY_END_SEC = 480     # no new entries after minute 8
+ENTRY_END_SEC = 480     # stop new entries after minute 8
 REFRESH_DEFAULT = 10
 HTTP_TIMEOUT = 20
 
 
-# ----------------------------
-# BASIC HELPERS
-# ----------------------------
+# -------------------------------------------------
+# HELPERS
+# -------------------------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return default
 
 
 def parse_dt(value: Any) -> Optional[datetime]:
@@ -51,43 +44,36 @@ def parse_dt(value: Any) -> Optional[datetime]:
         return None
 
 
-def get_first_nonempty(d: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
-    for k in keys:
-        if k in d and d[k] not in (None, "", [], {}):
-            return d[k]
-    return default
+def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 
-def parse_jsonish_list(value: Any) -> List[Any]:
-    """
-    Polymarket Gamma often returns list-like fields as JSON strings.
-    This safely turns them into Python lists.
-    """
+def to_list(value: Any) -> List[Any]:
     if value is None:
         return []
-
     if isinstance(value, list):
         return value
-
     if isinstance(value, str):
-        text = value.strip()
-        if not text:
+        s = value.strip()
+        if not s:
             return []
         try:
-            parsed = ast.literal_eval(text)
+            parsed = json.loads(s)
             return parsed if isinstance(parsed, list) else []
         except Exception:
             try:
-                import json
-                parsed = json.loads(text)
+                import ast
+                parsed = ast.literal_eval(s)
                 return parsed if isinstance(parsed, list) else []
             except Exception:
                 return []
-
     return []
 
 
-def polymarket_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+def pm_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     try:
         r = requests.get(f"{GAMMA_BASE}{path}", params=params, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
@@ -96,10 +82,17 @@ def polymarket_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return None
 
 
-# ----------------------------
-# BINANCE DATA
-# ----------------------------
-def get_binance_klines(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 180) -> pd.DataFrame:
+def get_first(d: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+    for k in keys:
+        if k in d and d[k] not in (None, "", [], {}):
+            return d[k]
+    return default
+
+
+# -------------------------------------------------
+# BINANCE
+# -------------------------------------------------
+def get_binance_klines(symbol: str, interval: str = "1m", limit: int = 180) -> pd.DataFrame:
     try:
         r = requests.get(
             f"{BINANCE_BASE}/api/v3/klines",
@@ -137,11 +130,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
-    # EMAs
     df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
 
-    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -151,20 +142,17 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = avg_gain / avg_loss
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # MACD
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
-    # Stochastic
     low14 = df["low"].rolling(14).min()
     high14 = df["high"].rolling(14).max()
     denom = (high14 - low14).replace(0, np.nan)
     df["stoch_k"] = 100 * (df["close"] - low14) / denom
     df["stoch_d"] = df["stoch_k"].rolling(3).mean()
 
-    # ATR
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - df["close"].shift()).abs()
     tr3 = (df["low"] - df["close"].shift()).abs()
@@ -189,7 +177,6 @@ def estimate_up_probability(df: pd.DataFrame) -> Tuple[Optional[float], str]:
     bear = 0
     reasons = []
 
-    # Trend
     if last["ema_fast"] > last["ema_slow"]:
         bull += 1
         reasons.append("EMA bullish")
@@ -197,7 +184,6 @@ def estimate_up_probability(df: pd.DataFrame) -> Tuple[Optional[float], str]:
         bear += 1
         reasons.append("EMA bearish")
 
-    # Momentum
     if last["macd"] > last["macd_signal"] and last["macd"] >= prev["macd"]:
         bull += 1
         reasons.append("MACD bullish")
@@ -205,7 +191,6 @@ def estimate_up_probability(df: pd.DataFrame) -> Tuple[Optional[float], str]:
         bear += 1
         reasons.append("MACD bearish")
 
-    # RSI zone
     if 54 <= last["rsi"] <= 66:
         bull += 1
         reasons.append("RSI bullish zone")
@@ -213,7 +198,6 @@ def estimate_up_probability(df: pd.DataFrame) -> Tuple[Optional[float], str]:
         bear += 1
         reasons.append("RSI bearish zone")
 
-    # Stochastic timing
     if last["stoch_k"] > last["stoch_d"] and 35 <= last["stoch_k"] <= 78:
         bull += 1
         reasons.append("Stochastic bullish")
@@ -221,13 +205,11 @@ def estimate_up_probability(df: pd.DataFrame) -> Tuple[Optional[float], str]:
         bear += 1
         reasons.append("Stochastic bearish")
 
-    # Volatility filter
     atr_pct = (last["atr"] / last["close"]) if last["close"] else 0
     vol_ok = atr_pct >= 0.0008
     if vol_ok:
         reasons.append("Volatility OK")
 
-    # Very conservative mapping
     if bull >= 4 and bear == 0 and vol_ok:
         return 0.66, ", ".join(reasons)
     if bull >= 3 and bear == 0 and vol_ok:
@@ -240,19 +222,16 @@ def estimate_up_probability(df: pd.DataFrame) -> Tuple[Optional[float], str]:
     return 0.50, "No strong directional edge"
 
 
-# ----------------------------
-# POLYMARKET MARKET DISCOVERY
-# ----------------------------
-def get_active_markets(limit: int = 100, max_pages: int = 8) -> List[Dict[str, Any]]:
-    """
-    Uses the public Gamma markets endpoint with offset paging.
-    """
-    all_rows: List[Dict[str, Any]] = []
+# -------------------------------------------------
+# POLYMARKET DISCOVERY
+# -------------------------------------------------
+def get_active_events(limit: int = 100, max_pages: int = 8) -> List[Dict[str, Any]]:
+    all_events: List[Dict[str, Any]] = []
 
     for page in range(max_pages):
         offset = page * limit
-        data = polymarket_get(
-            "/markets",
+        data = pm_get(
+            "/events",
             params={
                 "active": "true",
                 "closed": "false",
@@ -264,178 +243,189 @@ def get_active_markets(limit: int = 100, max_pages: int = 8) -> List[Dict[str, A
         if not isinstance(data, list) or not data:
             break
 
-        all_rows.extend(data)
+        all_events.extend(data)
 
         if len(data) < limit:
             break
 
-    return all_rows
+    return all_events
 
 
-def build_market_text(m: Dict[str, Any]) -> str:
-    pieces = [
-        str(get_first_nonempty(m, ["question", "title", "slug"], "")),
-        str(get_first_nonempty(m, ["description"], "")),
-        str(get_first_nonempty(m, ["slug"], "")),
+def event_text(event: Dict[str, Any]) -> str:
+    parts = [
+        str(get_first(event, ["title", "question", "slug"], "")),
+        str(get_first(event, ["subtitle", "description"], "")),
+        str(get_first(event, ["slug"], "")),
     ]
-    return " ".join(pieces).strip().lower()
+    return " ".join(parts).lower()
 
 
-def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
-    question = get_first_nonempty(m, ["question", "title", "slug"], "Unknown market")
-    slug = get_first_nonempty(m, ["slug"], "")
-    market_id = str(get_first_nonempty(m, ["id", "conditionId", "questionID"], slug or question))
-
-    start_dt = parse_dt(get_first_nonempty(m, ["startDate", "start_date", "createdAt", "created_at"]))
-    end_dt = parse_dt(get_first_nonempty(m, ["endDate", "end_date", "umaEndDate", "uma_end_date"]))
-
-    outcomes = parse_jsonish_list(m.get("outcomes"))
-    outcome_prices = [safe_float(x) for x in parse_jsonish_list(m.get("outcomePrices"))]
-
-    # Pad if malformed
-    if len(outcome_prices) < len(outcomes):
-        outcome_prices += [None] * (len(outcomes) - len(outcome_prices))
-
-    outcome_map = {}
-    for i, name in enumerate(outcomes):
-        outcome_map[str(name)] = outcome_prices[i] if i < len(outcome_prices) else None
-
-    text = build_market_text(m)
-
-    return {
-        "id": market_id,
-        "question": str(question),
-        "slug": str(slug),
-        "start_dt": start_dt,
-        "end_dt": end_dt,
-        "outcomes": [str(x) for x in outcomes],
-        "outcome_prices": outcome_prices,
-        "outcome_map": outcome_map,
-        "raw": m,
-        "text": text,
-    }
+def market_text(market: Dict[str, Any]) -> str:
+    parts = [
+        str(get_first(market, ["question", "title", "slug"], "")),
+        str(get_first(market, ["description"], "")),
+        str(get_first(market, ["slug"], "")),
+    ]
+    return " ".join(parts).lower()
 
 
-def looks_like_target_market(asset: str, text: str) -> bool:
+def asset_match(asset: str, text: str) -> bool:
     text = text.lower()
-
     if asset == "BTC":
-        asset_ok = ("bitcoin" in text) or ("btc" in text)
-    else:
-        asset_ok = ("ethereum" in text) or ("ether" in text) or ("eth" in text)
+        return ("btc" in text) or ("bitcoin" in text)
+    return ("eth" in text) or ("ether" in text) or ("ethereum" in text)
 
-    short_window_ok = (
+
+def is_15m_updown(text: str) -> bool:
+    text = text.lower()
+    return (
         ("15 minute" in text)
         or ("15-minute" in text)
         or ("15m" in text)
         or ("15 min" in text)
+        or ("up or down" in text)
+        or ("up/down" in text)
     )
 
-    direction_ok = ("up or down" in text) or ("up/down" in text) or ("price to beat" in text)
 
-    return asset_ok and (short_window_ok or direction_ok)
+def normalize_event_market(event: Dict[str, Any], market: Dict[str, Any]) -> Dict[str, Any]:
+    question = str(get_first(market, ["question", "title"], get_first(event, ["title"], "Unknown market")))
+    slug = str(get_first(market, ["slug"], get_first(event, ["slug"], "")))
+
+    start_dt = parse_dt(get_first(market, ["startDate", "start_date"], get_first(event, ["startDate", "start_date"])))
+    end_dt = parse_dt(get_first(market, ["endDate", "end_date"], get_first(event, ["endDate", "end_date"])))
+
+    outcomes = to_list(market.get("outcomes"))
+    prices = [safe_float(x) for x in to_list(market.get("outcomePrices"))]
+
+    if len(prices) < len(outcomes):
+        prices += [None] * (len(outcomes) - len(prices))
+
+    outcome_map = {}
+    for i, name in enumerate(outcomes):
+        outcome_map[str(name)] = prices[i] if i < len(prices) else None
+
+    return {
+        "id": str(get_first(market, ["id", "conditionId"], slug or question)),
+        "question": question,
+        "slug": slug,
+        "start_dt": start_dt,
+        "end_dt": end_dt,
+        "outcomes": [str(x) for x in outcomes],
+        "outcome_prices": prices,
+        "outcome_map": outcome_map,
+        "event_title": str(get_first(event, ["title"], "")),
+        "event_slug": str(get_first(event, ["slug"], "")),
+    }
 
 
 def choose_current_polymarket(asset: str) -> Optional[Dict[str, Any]]:
     now = now_utc()
-    markets = [normalize_market(m) for m in get_active_markets()]
+    events = get_active_events()
 
     candidates: List[Dict[str, Any]] = []
 
-    for m in markets:
-        if not looks_like_target_market(asset, m["text"]):
+    for event in events:
+        etext = event_text(event)
+        if not asset_match(asset, etext):
+            continue
+        if not is_15m_updown(etext):
             continue
 
-        end_dt = m["end_dt"]
-        if end_dt is None:
+        markets = event.get("markets", [])
+        if not isinstance(markets, list) or not markets:
             continue
 
-        if end_dt <= now:
-            continue
+        for market in markets:
+            mtext = market_text(market) + " " + etext
+            if not asset_match(asset, mtext):
+                continue
+            if not is_15m_updown(mtext):
+                continue
 
-        start_dt = m["start_dt"]
-        if start_dt is not None and start_dt > now:
-            continue
+            nm = normalize_event_market(event, market)
 
-        seconds_left = int((end_dt - now).total_seconds())
+            if nm["end_dt"] is None:
+                continue
+            if nm["end_dt"] <= now:
+                continue
+            if nm["start_dt"] is not None and nm["start_dt"] > now:
+                continue
 
-        # We only care about the current/near-current short market
-        if seconds_left > 20 * 60:
-            continue
+            seconds_left = int((nm["end_dt"] - now).total_seconds())
+            if seconds_left > 20 * 60:
+                continue
 
-        m["seconds_left"] = seconds_left
-        m["elapsed"] = int((now - start_dt).total_seconds()) if start_dt else None
-        candidates.append(m)
+            elapsed = int((now - nm["start_dt"]).total_seconds()) if nm["start_dt"] else None
+
+            nm["seconds_left"] = seconds_left
+            nm["elapsed"] = elapsed
+            candidates.append(nm)
 
     if not candidates:
         return None
 
-    # Pick the live market ending soonest
     candidates.sort(key=lambda x: x["seconds_left"])
     return candidates[0]
 
 
-# ----------------------------
-# POLYMARKET OUTCOME LOGIC
-# ----------------------------
-def get_up_down_labels(market: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+# -------------------------------------------------
+# POLYMARKET PRICING
+# -------------------------------------------------
+def get_yes_no_labels(market: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     outcomes = market.get("outcomes", [])
     lower_map = {o.lower(): o for o in outcomes}
 
-    up_label = None
-    down_label = None
+    yes_label = lower_map.get("yes")
+    no_label = lower_map.get("no")
 
-    for key in ["up", "yes"]:
-        if key in lower_map:
-            up_label = lower_map[key]
-            break
+    if yes_label is None and len(outcomes) >= 1:
+        yes_label = outcomes[0]
+    if no_label is None and len(outcomes) >= 2:
+        no_label = outcomes[1]
 
-    for key in ["down", "no"]:
-        if key in lower_map:
-            down_label = lower_map[key]
-            break
-
-    if up_label is None and len(outcomes) >= 1:
-        up_label = outcomes[0]
-    if down_label is None and len(outcomes) >= 2:
-        down_label = outcomes[1]
-
-    return up_label, down_label
+    return yes_label, no_label
 
 
-def get_market_up_probability(market: Dict[str, Any]) -> Optional[float]:
-    up_label, _ = get_up_down_labels(market)
-    if not up_label:
+def get_market_yes_probability(market: Dict[str, Any]) -> Optional[float]:
+    yes_label, _ = get_yes_no_labels(market)
+    if not yes_label:
         return None
 
-    price = market["outcome_map"].get(up_label)
-    if price is None:
+    p = market["outcome_map"].get(yes_label)
+    if p is None:
         return None
 
-    try:
-        p = float(price)
-        # Gamma prices are typically 0.00–1.00, but if some feed is 0–100 we normalize.
-        if p > 1.0:
-            p = p / 100.0
-        return p
-    except Exception:
-        return None
+    p = float(p)
+    if p > 1.0:
+        p = p / 100.0
+    return p
 
 
-def decision_text_for_outcome(market: Dict[str, Any], bullish: bool) -> str:
-    up_label, down_label = get_up_down_labels(market)
-    if bullish:
-        return f"BUY {up_label.upper() if up_label else 'UP'}"
-    return f"BUY {down_label.upper() if down_label else 'DOWN'}"
+def extract_price_to_beat(text: str) -> Optional[float]:
+    patterns = [
+        r"above\s+\$?([0-9,]+(?:\.[0-9]+)?)",
+        r"below\s+\$?([0-9,]+(?:\.[0-9]+)?)",
+        r"over\s+\$?([0-9,]+(?:\.[0-9]+)?)",
+        r"under\s+\$?([0-9,]+(?:\.[0-9]+)?)",
+    ]
+    lower = text.lower()
+    for p in patterns:
+        m = re.search(p, lower)
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except Exception:
+                return None
+    return None
 
 
-# ----------------------------
-# LOCKED DECISION PER EXACT MARKET
-# ----------------------------
+# -------------------------------------------------
+# DECISION ENGINE
+# -------------------------------------------------
 def decide_for_market(market: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
     elapsed = market.get("elapsed")
 
-    # If start time isn't present, we fall back to "evaluate now"
     if elapsed is not None:
         if elapsed < ENTRY_START_SEC:
             return {
@@ -459,33 +449,33 @@ def decide_for_market(market: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any
             "locked": True,
         }
 
-    market_up = get_market_up_probability(market)
-    if market_up is None:
+    market_yes = get_market_yes_probability(market)
+    if market_yes is None:
         return {
             "signal": "IGNORE THIS MARKET",
-            "reason": "Polymarket live outcome price unavailable",
+            "reason": "Polymarket live YES price unavailable",
             "locked": True,
         }
 
-    edge = model_up - market_up
+    edge = model_up - market_yes
 
     if model_up >= 0.60 and edge >= 0.08:
         return {
-            "signal": decision_text_for_outcome(market, bullish=True),
-            "reason": f"{model_reason} | Model UP={model_up:.0%}, Market UP={market_up:.0%}",
+            "signal": "BUY YES",
+            "reason": f"{model_reason} | Model UP={model_up:.0%}, Market YES={market_yes:.0%}",
             "locked": True,
         }
 
     if model_up <= 0.40 and (-edge) >= 0.08:
         return {
-            "signal": decision_text_for_outcome(market, bullish=False),
-            "reason": f"{model_reason} | Model DOWN={1-model_up:.0%}, Market DOWN={1-market_up:.0%}",
+            "signal": "BUY NO",
+            "reason": f"{model_reason} | Model DOWN={1-model_up:.0%}, Market NO={1-market_yes:.0%}",
             "locked": True,
         }
 
     return {
         "signal": "IGNORE THIS MARKET",
-        "reason": f"No strong edge | Model UP={model_up:.0%}, Market UP={market_up:.0%}",
+        "reason": f"No strong edge | Model UP={model_up:.0%}, Market YES={market_yes:.0%}",
         "locked": True,
     }
 
@@ -511,27 +501,9 @@ def get_locked_decision(asset: str, market: Dict[str, Any], df: pd.DataFrame) ->
     return result
 
 
-# ----------------------------
-# DISPLAY HELPERS
-# ----------------------------
-def extract_price_to_beat(text: str) -> Optional[float]:
-    patterns = [
-        r"above\s+\$?([0-9,]+(?:\.[0-9]+)?)",
-        r"below\s+\$?([0-9,]+(?:\.[0-9]+)?)",
-        r"over\s+\$?([0-9,]+(?:\.[0-9]+)?)",
-        r"under\s+\$?([0-9,]+(?:\.[0-9]+)?)",
-    ]
-    lower = text.lower()
-    for p in patterns:
-        m = re.search(p, lower)
-        if m:
-            try:
-                return float(m.group(1).replace(",", ""))
-            except Exception:
-                return None
-    return None
-
-
+# -------------------------------------------------
+# UI
+# -------------------------------------------------
 def render_asset(asset: str, symbol: str) -> None:
     market = choose_current_polymarket(asset)
 
@@ -546,8 +518,8 @@ def render_asset(asset: str, symbol: str) -> None:
     df = add_indicators(df)
     result = get_locked_decision(asset, market, df)
 
-    up_label, down_label = get_up_down_labels(market)
-    market_up = get_market_up_probability(market)
+    yes_label, no_label = get_yes_no_labels(market)
+    market_yes = get_market_yes_probability(market)
     target = extract_price_to_beat(market["question"])
 
     st.write(f"**Current market:** {market['question']}")
@@ -565,35 +537,31 @@ def render_asset(asset: str, symbol: str) -> None:
     elif market["end_dt"]:
         st.write(f"**Ends at:** {market['end_dt'].strftime('%H:%M:%S')} UTC")
 
-    st.write(f"**Outcomes:** {up_label} / {down_label}")
+    st.write(f"**Outcomes:** {yes_label} / {no_label}")
     st.write(f"**Signal:** ### {result['signal']}")
     st.caption(result["reason"])
     st.caption("LOCKED" if result["locked"] else "NOT LOCKED YET")
 
-    if market["seconds_left"] is not None:
+    if market.get("seconds_left") is not None:
         mins = market["seconds_left"] // 60
         secs = market["seconds_left"] % 60
         st.caption(f"Time left: {mins:02d}:{secs:02d}")
 
-    if market_up is not None:
-        st.caption(f"Live market UP price: {market_up:.0%}")
+    if market_yes is not None:
+        st.caption(f"Live YES price: {market_yes:.0%}")
 
-    if market["outcomes"] and market["outcome_prices"]:
-        pairs = []
-        for name in market["outcomes"]:
-            price = market["outcome_map"].get(name)
-            if price is not None:
-                p = float(price)
-                if p > 1.0:
-                    p = p / 100.0
-                pairs.append(f"{name}: {p:.0%}")
-        if pairs:
-            st.caption("Outcome prices — " + " | ".join(pairs))
+    pairs = []
+    for name in market["outcomes"]:
+        price = market["outcome_map"].get(name)
+        if price is not None:
+            p = float(price)
+            if p > 1.0:
+                p = p / 100.0
+            pairs.append(f"{name}: {p:.0%}")
+    if pairs:
+        st.caption("Outcome prices — " + " | ".join(pairs))
 
 
-# ----------------------------
-# APP
-# ----------------------------
 st.set_page_config(page_title="Polymarket 15m Locked Signal Bot", layout="centered")
 
 st.title("Polymarket 15-Min Locked Signal Bot")
@@ -601,12 +569,12 @@ st.write("One decision only per exact live Polymarket market")
 
 refresh = st.slider("Refresh every (seconds)", 5, 60, REFRESH_DEFAULT)
 
-left_col, right_col = st.columns(2)
+col1, col2 = st.columns(2)
 
-with left_col:
+with col1:
     render_asset("BTC", "BTCUSDT")
 
-with right_col:
+with col2:
     render_asset("ETH", "ETHUSDT")
 
 time.sleep(refresh)
